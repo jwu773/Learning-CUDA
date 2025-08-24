@@ -5,7 +5,6 @@
 #define threadsNumPerBlock 1024  //todo
 #define twiceTNPB 2048    //2 * threadsNumPerBlock
 
-
 /**
  * @brief Find the k-th largest element in a vector using CUDA.
  * 
