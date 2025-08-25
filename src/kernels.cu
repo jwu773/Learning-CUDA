@@ -4,6 +4,7 @@
 
 #define threadsNumPerBlock 1024  //todo
 #define twiceTNPB 2048    //2 * threadsNumPerBlock
+#define smemCapa 16384    //96KB shared memory can store 16384 float/int
 
 
 /**
@@ -19,63 +20,22 @@
  * @note For invalid cases, return T(-100).
  * @note Handles device memory management (allocate/copy/free) internally. Errors should be thrown.
  */
-template <typename T>
-T kthLargest(const std::vector<T>& h_input, size_t k) {
-  // TODO: Implement the kthLargest function
 
-  uint h_size = h_input.size();
-  if(k <= 0 || k > h_size)
-  	return T(-100);
 
-  uint smemCapa = 1 << 14;  //96KB shared memory can store 2^14 float/int
-  uint d_arrSize = 1;
-  while(d_arrSize < h_size){
-        d_arrSize <<= 1;
-  }
-  T* d_arr;
-  cudaMalloc((void**)&d_arr, d_arrSize * sizeof(T));
-  //cudaHostRegister(h_input, d_size * sizeof(T), cudaHostAllocDefault);
-  cudaMemcpyAsync(d_arr, h_input, h_size * sizeof(T), cudaMemcpyHostToDevice);
-  cudaMemset(d_arr + h_size, 0xfe, sizeof(T) * (d_arrSize - h_size));  //0xfe may error
-  
-  uint eleNumInSharedMem = min(16384, d_arrSize); //todo.the number of array elements in the shared memory of a block
-    uint blocksNumPerGrid = d_arrSize / eleNumInSharedMem;
-    //printf("d_arrSize %d,  blockNum %d,  eleNumInBlock %d\n", d_arrSize, blocksNumPerGrid, eleNumInSharedMem);
-    BitonicSort_Prolog<<<blocksNumPerGrid, threadsNumPerBlock>>>(d_arr, size, eleNumInSharedMem);
 
-    for(uint len = eleNumInSharedMem << 1; len <= d_arrSize; len <<= 1){
-        //printf("============== stage ============ length: %d\n", len);
-        for(uint stride = len >> 1; stride > 0; stride >>= 1){
-            //printf("..........step.........: stride: %d\n",stride);
-            if(stride >= eleNumInSharedMem){
-                BitonicSort_GlobalMem<<<blocksNumPerGrid, threadsNumPerBlock>>>(d_arr, stride, len, d_arrSize, eleNumInSharedMem);
-            }
-            else{
-                BitonicSort_SharedMem<<<blocksNumPerGrid, threadsNumPerBlock>>>(d_arr, stride, len, d_arrSize, eleNumInSharedMem);
-                continue;
-            }
-        }
-    }
 
-    T res;
-    cudaMemcpy(&res, d_arr + d_arrSize - k, sizeof(T), cudaMemcpyDeviceToHost);
-    return res;
-  }    
 
-__global__ void BitonicSort_Prolog(short* d_arr, uint h_arrSize, uint eleNumInSharedMem){
-    //extern __shared__ short s_arr[];        //todo:create 2 arrays to avoid bank conflict?
-    __shared__ short s_arr[16384];  //todo
+__global__ void BitonicSort_Prolog(T* d_arr, uint eleNumInSharedMem){
+    //extern __shared__ T s_arr[];        //todo:create 2 arrays to avoid bank conflict?
+    __shared__ T s_arr[eleNumInSharedMem];  
     uint preBlksEleNum = blockIdx.x * eleNumInSharedMem;   //the num of array elements in previous blocks
-    uint idx = preBlksEleNum + threadIdx.x;  //idx: index in d_arr
+    uint idx = preBlksEleNum + threadIdx.x;  //idx:index in d_arr;   i: index in s_arr
+    //load data from global mem to shared mem
     for(uint i = threadIdx.x; i < eleNumInSharedMem; i += threadsNumPerBlock){
-        if(idx >= h_arrSize)
-            s_arr[i] = 1001;  //pad with 1001
-        else
-            s_arr[i] = d_arr[idx];
+        s_arr[i] = d_arr[idx];
         idx += threadsNumPerBlock;
     }        
 
-    //each block processes a sublist in its shared memory
     for(int len = 2; len <= eleNumInSharedMem; len <<= 1){         
         for(uint stride = len >> 1; stride > 0; stride >>= 1){
             __syncthreads();
@@ -85,7 +45,7 @@ __global__ void BitonicSort_Prolog(short* d_arr, uint h_arrSize, uint eleNumInSh
             uint idx2 = idx1 + stride;
             bool descend = (len & (preBlksEleNum + idx1)) != 0; 
             if((descend && s_arr[idx1] < s_arr[idx2]) || (!descend && s_arr[idx1] > s_arr[idx2])){ 
-                short tem = s_arr[idx1];
+                T tem = s_arr[idx1];
                 s_arr[idx1] = s_arr[idx2];
                 s_arr[idx2] = tem;
             }
@@ -104,7 +64,7 @@ __global__ void BitonicSort_Prolog(short* d_arr, uint h_arrSize, uint eleNumInSh
                 idx2 = idx1 + stride;
                 descend = (len & (preBlksEleNum + idx1)) != 0;
                 if((descend && s_arr[idx1] < s_arr[idx2]) || (!descend && s_arr[idx1] > s_arr[idx2])){ 
-                    short tem = s_arr[idx1];
+                    T tem = s_arr[idx1];
                     s_arr[idx1] = s_arr[idx2];
                     s_arr[idx2] = tem;
                 }
@@ -113,7 +73,7 @@ __global__ void BitonicSort_Prolog(short* d_arr, uint h_arrSize, uint eleNumInSh
     }
     //copy sorted sublist from shared memory to global memory
     __syncthreads();
-    idx = preBlksEleNum + threadIdx.x;  //idx: index in d_arr
+    idx = preBlksEleNum + threadIdx.x; 
     for(uint i = threadIdx.x; i < eleNumInSharedMem; i += threadsNumPerBlock){
         d_arr[idx] = s_arr[i];
         idx += threadsNumPerBlock;
@@ -122,7 +82,7 @@ __global__ void BitonicSort_Prolog(short* d_arr, uint h_arrSize, uint eleNumInSh
 
 
 
-__global__ void BitonicSort_GlobalMem(short* d_arr, uint stride, uint len, uint dsize, uint eleNumInSharedMem){
+__global__ void BitonicSort_GlobalMem(T* d_arr, uint stride, uint len, uint dsize){
     uint totalThreadNum = gridDim.x * threadsNumPerBlock; 
     uint tid = blockIdx.x * blockDim.x + threadIdx.x;
     bool smallStride = stride < totalThreadNum;
@@ -130,16 +90,8 @@ __global__ void BitonicSort_GlobalMem(short* d_arr, uint stride, uint len, uint 
     uint idx2 = idx1 + stride; 
     bool descend = (len & idx1) != 0;
 
-    /*debug
-    short* arr1 = (short*)malloc(64 * sizeof(short));
-    short* arr2 = (short*)malloc(64 * sizeof(short));
-    bool* signal = (bool*)malloc(64 * sizeof(bool));
-    uint p = 0;
-    arr1[p] = idx1; arr2[p] = idx2; signal[p] = descend;
-    **/
-
     if((descend && d_arr[idx1] < d_arr[idx2]) || (!descend && d_arr[idx1] > d_arr[idx2])){
-        short tem = d_arr[idx1];
+        T tem = d_arr[idx1];
         d_arr[idx1] = d_arr[idx2];
         d_arr[idx2] = tem;
     }
@@ -148,7 +100,7 @@ __global__ void BitonicSort_GlobalMem(short* d_arr, uint stride, uint len, uint 
     uint round;
     for(round = 1; round < dsize / (totalThreadNum * 2); round++){
         if(smallStride){
-            idx1 += (totalThreadNum << 1);
+            idx1 += totalThreadNum * 2;
         }
         else{
             if(round % range == 0)
@@ -159,29 +111,20 @@ __global__ void BitonicSort_GlobalMem(short* d_arr, uint stride, uint len, uint 
         idx2 = idx1 + stride;
         descend = (len & idx1) != 0;
         if((descend && d_arr[idx1] < d_arr[idx2]) || (!descend && d_arr[idx1] > d_arr[idx2])){
-            short tem = d_arr[idx1];
+            T tem = d_arr[idx1];
             d_arr[idx1] = d_arr[idx2];
             d_arr[idx2] = tem;
         }
-        /*
-        p++;
-        arr1[p] = idx1; arr2[p] = idx2; signal[p] = descend;**/
     }
-
-    /* debug
-    for(uint e = 0; e <= p; e++){
-        printf("bid %d : tid %d: global swap, stride= %d.....,     %d  vs  %d,  down? %d\n",  blockIdx.x, threadIdx.x, stride, arr1[e], arr2[e], signal[e]);
-    } 
-    **/ 
 }
 
 
 
-__global__ void BitonicSort_SharedMem(short* d_arr, uint stride, uint len, uint dsize, uint eleNumInSharedMem){
-    __shared__ short s_arr[16384];
-    //extern __shared__ short s_arr[];
+__global__ void BitonicSort_SharedMem(T* d_arr, uint stride, uint len, uint eleNumInSharedMem){
+    __shared__ T s_arr[eleNumInSharedMem];
+    //extern __shared__ T s_arr[];
     uint preBlksEleNum = blockIdx.x * eleNumInSharedMem;   //the num of array elements in previous blocks
-    uint idx = preBlksEleNum + threadIdx.x;  //idx: index in d_arr
+    uint idx = preBlksEleNum + threadIdx.x; 
     for(uint i = threadIdx.x; i < eleNumInSharedMem; i += threadsNumPerBlock){ 
         s_arr[i] = d_arr[idx];
         idx += threadsNumPerBlock;
@@ -192,7 +135,7 @@ __global__ void BitonicSort_SharedMem(short* d_arr, uint stride, uint len, uint 
         uint idx2 = idx1 + stride;
         bool descend = (len & (preBlksEleNum + idx1)) != 0; 
         if((descend && s_arr[idx1] < s_arr[idx2]) || (!descend && s_arr[idx1] > s_arr[idx2])){ 
-            short tem = s_arr[idx1];
+            T tem = s_arr[idx1];
             s_arr[idx1] = s_arr[idx2];
             s_arr[idx2] = tem;
         }
@@ -211,7 +154,7 @@ __global__ void BitonicSort_SharedMem(short* d_arr, uint stride, uint len, uint 
             idx2 = idx1 + stride;
             descend = (len & (preBlksEleNum + idx1)) != 0;
             if((descend && s_arr[idx1] < s_arr[idx2]) || (!descend && s_arr[idx1] > s_arr[idx2])){ 
-                short tem = s_arr[idx1];
+                T tem = s_arr[idx1];
                 s_arr[idx1] = s_arr[idx2];
                 s_arr[idx2] = tem;
             }
@@ -220,13 +163,55 @@ __global__ void BitonicSort_SharedMem(short* d_arr, uint stride, uint len, uint 
     }
     //copy sorted sublist from shared memory to global memory
     __syncthreads();
-    idx = preBlksEleNum + threadIdx.x;  //idx: index in d_arr
+    idx = preBlksEleNum + threadIdx.x;
     for(uint i = threadIdx.x; i < eleNumInSharedMem; i += threadsNumPerBlock){
         d_arr[idx] = s_arr[i];
         idx += threadsNumPerBlock;
     }      
 }
 
+
+
+template <typename T>
+T kthLargest(const std::vector<T>& h_input, size_t k) {
+  // TODO: Implement the kthLargest function
+
+  uint h_size = h_input.size();
+  if(k <= 0 || k > h_size)
+    return T(-100);
+
+  uint d_arrSize = 1;
+  while(d_arrSize < h_size){    //bitonic sort: array size needs to be the power of 2
+        d_arrSize <<= 1;
+  }
+  T* d_arr;
+  cudaMalloc((void**)&d_arr, d_arrSize * sizeof(T));
+  //cudaHostRegister(h_input, d_size * sizeof(T), cudaHostAllocDefault);
+  cudaMemcpyAsync(d_arr, h_input, h_size * sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemset(d_arr + h_size, 0xfe, sizeof(T) * (d_arrSize - h_size));  //0xfe: -inf if T is float. Pad the array with -inf
+  
+  uint eleNumInSharedMem = min(smemCapa, d_arrSize); //the number of array elements in the shared memory of a block
+  uint blocksNumPerGrid = d_arrSize / eleNumInSharedMem;
+    //printf("d_arrSize %d,  blockNum %d,  eleNumInBlock %d\n", d_arrSize, blocksNumPerGrid, eleNumInSharedMem);
+  BitonicSort_Prolog<<<blocksNumPerGrid, threadsNumPerBlock>>>(d_arr, eleNumInSharedMem);
+
+    for(uint len = eleNumInSharedMem << 1; len <= d_arrSize; len <<= 1){
+        for(uint stride = len >> 1; stride > 0; stride >>= 1){
+            if(stride >= eleNumInSharedMem){
+                BitonicSort_GlobalMem<<<blocksNumPerGrid, threadsNumPerBlock>>>(d_arr, stride, len, d_arrSize);
+            }
+            else{
+                BitonicSort_SharedMem<<<blocksNumPerGrid, threadsNumPerBlock>>>(d_arr, stride, len, eleNumInSharedMem);
+                continue;
+            }
+        }
+    }
+    T res;
+    cudaMemcpy(&res, d_arr + d_arrSize - k, sizeof(T), cudaMemcpyDeviceToHost);
+    cudaFreeHost(d_arr);
+    
+    return res;
+  } 
 
 
 
@@ -247,47 +232,6 @@ __global__ void BitonicSort_SharedMem(short* d_arr, uint stride, uint len, uint 
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
-template <typename T>
-void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
-                    const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) { 
-    float scaleFactor = 1.0 / sqrt(head_dim);   
-    T* d_q;
-    uint sizeQ = batch_size * tgt_seq_len * query_heads * head_dim;
-    cudaMalloc((void**)&d_q, sizeQ * sizeof(T)); 
-    cudaMemcpyAsync(d_q, h_q, sizeQ * sizeof(T), cudaMemcpyHostToDevice);   
-    T* d_k;
-    uint sizeK = batch_size * src_seq_len * kv_heads * head_dim;
-    cudaMalloc((void**)&d_k, sizeK * sizeof(T)); 
-    cudaMemcpyAsync(d_k, h_k, sizeK * sizeof(T), cudaMemcpyHostToDevice);       
-    T* d_v;
-    cudaMalloc((void**)&d_v, sizeK * sizeof(T)); 
-    cudaMemcpyAsync(d_v, h_v, sizeK * sizeof(T), cudaMemcpyHostToDevice);
-    T* d_o;
-    cudaMalloc((void**)&d_o, sizeQ * sizeof(T));
-    cudaMemsetAsync(d_o, 0x00, sizeQ * sizeof(T));
-
-    T* d_l;
-    uint sizeL = batch_size * tgt_seq_len * query_heads;
-    cudaMalloc((void**)&d_l,  sizeL * sizeof(T));
-    cudaMemsetAsync(d_l, 0x00, sizeL * sizeof(T));
-    
-    T* d_m;
-    cudaMalloc((void**)&d_m,  sizeL * sizeof(T));
-    cudaMemsetAsync(d_m, 0xfe, sizeL * sizeof(T));
-
-    dim3 grid_dim(batch_size, tgt_seq_len);
-    dim3 block_dim(32);
-    int Tcr = (query_heads - 1) / 32 + 1;
-
-    attentionKernel<<<grid_dim, block_dim, sram_size>>>(d_q,d_k,d_v,d_o,d_l,d_m,scaleFactor,Tcr, batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, s_causal);
-
-    cudaMemcpyAsync(h_o, d_o, sizeQ * sizeof(T), cudaMemcpyDeviceToHost);  
-}
-
-
-
 
 
 
@@ -362,6 +306,58 @@ __global__ void attentionKernel(T* d_q, T* d_k, T* d_v, T* d_o, T* l, T* m, floa
     }
 
 }
+
+
+
+
+template <typename T>
+void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
+                    const std::vector<T>& h_v, std::vector<T>& h_o,
+                    int batch_size, int target_seq_len, int src_seq_len, 
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) { 
+    float scaleFactor = 1.0 / sqrt(head_dim);   
+    T* d_q;
+    uint sizeQ = batch_size * tgt_seq_len * query_heads * head_dim;
+    cudaMalloc((void**)&d_q, sizeQ * sizeof(T)); 
+    cudaMemcpyAsync(d_q, h_q, sizeQ * sizeof(T), cudaMemcpyHostToDevice);   
+    T* d_k;
+    uint sizeK = batch_size * src_seq_len * kv_heads * head_dim;
+    cudaMalloc((void**)&d_k, sizeK * sizeof(T)); 
+    cudaMemcpyAsync(d_k, h_k, sizeK * sizeof(T), cudaMemcpyHostToDevice);       
+    T* d_v;
+    cudaMalloc((void**)&d_v, sizeK * sizeof(T)); 
+    cudaMemcpyAsync(d_v, h_v, sizeK * sizeof(T), cudaMemcpyHostToDevice);
+    T* d_o;
+    cudaMalloc((void**)&d_o, sizeQ * sizeof(T));
+    cudaMemsetAsync(d_o, 0x00, sizeQ * sizeof(T));
+
+    T* d_l;
+    uint sizeL = batch_size * tgt_seq_len * query_heads;
+    cudaMalloc((void**)&d_l,  sizeL * sizeof(T));
+    cudaMemsetAsync(d_l, 0x00, sizeL * sizeof(T));
+    
+    T* d_m;
+    cudaMalloc((void**)&d_m,  sizeL * sizeof(T));
+    cudaMemsetAsync(d_m, 0xfe, sizeL * sizeof(T));
+
+    dim3 grid_dim(batch_size, tgt_seq_len);
+    dim3 block_dim(32);
+    int Tcr = (query_heads - 1) / 32 + 1;
+
+    attentionKernel<<<grid_dim, block_dim, sram_size>>>(d_q,d_k,d_v,d_o,d_l,d_m,scaleFactor,Tcr, batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, s_causal);
+
+    cudaMemcpyAsync(h_o, d_o, sizeQ * sizeof(T), cudaMemcpyDeviceToHost); 
+    cudaFreeHost(d_q);
+    cudaFreeHost(d_k);
+    cudaFreeHost(d_v);
+    cudaFreeHost(d_o);
+    cudaFreeHost(d_l);
+    cudaFreeHost(d_m);
+}
+
+
+
+
 
 // *********************************************************************
 // Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
