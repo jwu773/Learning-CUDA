@@ -182,7 +182,7 @@ T kthLargest(const std::vector<T>& h_input, size_t k) {
 
   size_t m = 1;
   while(m < n) m <<= 1;
-  std::vector<T> h_padded_input(m);//必须填充到2的幂次方
+  std::vector<T> h_padded_input(m);
   std::copy(h_input.begin(), h_input.end(), h_padded_input.begin());
   std::fill(h_padded_input.begin() + n, h_padded_input.end(), std::numeric_limits<T>::lowest());
 
@@ -241,8 +241,6 @@ __global__ void flashAttentionKernel(
     T* q, T* k, T* v, T* o, int batch_size,
     int target_seq_len, int src_seq_len, int query_heads, int kv_heads, int head_dim, bool is_causal) {
 
-        //uint blockId = blockIdx.z * (gridDim.y*gridDim.x) + blockIdx.y * gridDim.x + blockIdx.x;
-        //uint idx = blockId * (blockDim.y*blockDim.x) + threadIdx.y * blockDim.x + threadIdx.x;  //global idx for a thread
         int b_idx = blockIdx.z;
         int qh_head_idx = blockIdx.y;
         int q_row_idx = blockIdx.x * tileHeight + threadIdx.y;          
