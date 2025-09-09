@@ -248,7 +248,6 @@ __global__ void flashAttentionKernel(
         int q_row_idx = blockIdx.x * tileHeight + threadIdx.y;          
         
         int kv_head_idx = qh_head_idx * kv_heads / query_heads;
-        //int valid_seq_len = is_causal? min(q_row_idx + 1, src_seq_len) : src_seq_len;
         int valid_seq_len = src_seq_len;
 
 
